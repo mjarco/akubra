@@ -1,108 +1,120 @@
 package httphandler
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"io"
-	"log"
 	"net/http"
-	"time"
+	"sync/atomic"
 
-	"github.com/allegro/akubra/config"
-	"github.com/allegro/akubra/dial"
-	"github.com/allegro/akubra/transport"
+	"github.com/allegro/akubra/httphandler/config"
+	"github.com/allegro/akubra/log"
 )
 
-//Handler implements http.Handler interface
-type Handler struct {
-	config       config.Config
-	roundTripper http.RoundTripper
-	mainLog      *log.Logger
-	accessLog    *log.Logger
+func randomStr(length int) string {
+	randomID := make([]byte, length)
+	_, err := rand.Read(randomID)
+	if err != nil {
+		randomID = []byte("notrandomid")
+	}
+	return hex.EncodeToString(randomID)
 }
 
-func (h *Handler) closeBadRequest(w http.ResponseWriter) {
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
-		return
-	}
-
-	conn, _, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	closeErr := conn.Close()
-	if closeErr != nil {
-		h.mainLog.Println(closeErr.Error())
-		return
-	}
+// Handler implements http.Handler interface
+type Handler struct {
+	roundTripper          http.RoundTripper
+	bodyMaxSize           int64
+	maxConcurrentRequests int32
+	runningRequestCount   int32
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	resp, err := h.roundTripper.RoundTrip(req)
+	canServe := true
+	log.Printf("handler url %s", req.URL)
+	log.Printf("url host %s, header host %s, req host %s", req.URL.Host, req.Header.Get("Host"), req.Host)
 
-	if err != nil {
-		h.closeBadRequest(w)
-		w.WriteHeader(http.StatusBadRequest)
+	if atomic.AddInt32(&h.runningRequestCount, 1) > h.maxConcurrentRequests {
+		canServe = false
+	}
+	defer atomic.AddInt32(&h.runningRequestCount, -1)
+	if !canServe {
+		log.Printf("Rejected request from %s - too many other requests in progress.", req.Host)
+		http.Error(w, "Too many requests in progress.", http.StatusServiceUnavailable)
 		return
 	}
 
+	randomIDStr := randomStr(12)
+	validationCode := h.validateIncomingRequest(req)
+	if validationCode > 0 {
+		log.Printf("Rejected invalid incoming request from %s, code %d", req.RemoteAddr, validationCode)
+		w.WriteHeader(validationCode)
+		return
+	}
+
+	randomIDContext := context.WithValue(req.Context(), log.ContextreqIDKey, randomIDStr)
+	log.Debugf("Request id %s", randomIDStr)
+
+	resp, err := h.roundTripper.RoundTrip(req.WithContext(randomIDContext))
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("%s", err)
+		return
+	}
+	defer respBodyCloserFactory(resp, randomIDStr)()
+
+	wh := w.Header()
+	for k, v := range resp.Header {
+		wh[k] = v
+	}
+
 	w.WriteHeader(resp.StatusCode)
-	_, copyErr := io.Copy(w, resp.Body)
+	if resp.Body == nil {
+		return
+	}
 
-	defer func() {
-		if copyErr != nil {
-			h.mainLog.Printf("Cannot send response body reason: %q",
-				copyErr.Error())
-		}
-	}()
-
-	defer func() {
-		closeErr := resp.Body.Close()
-		if closeErr != nil {
-			h.mainLog.Printf("Cannot send response body reason: %q",
-				closeErr.Error())
-		}
-	}()
+	if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
+		log.Printf("Handler.ServeHTTP Cannot send response body %s reason: %q",
+			randomIDStr,
+			copyErr.Error())
+	} else {
+		log.Printf("Handler.ServeHTTP Sent response body %s",
+			randomIDStr)
+	}
 }
 
-//NewHandler will create Handler
-func NewHandler(conf config.Config) http.Handler {
-	mainlog := conf.Mainlog
-	rh := &responseMerger{
-		conf.Synclog,
-		mainlog,
-		conf.SyncLogMethodsSet}
-
-	connDuration, _ := time.ParseDuration(conf.ConnectionTimeout)
-	dialDuration, _ := time.ParseDuration(conf.ConnectionTimeout)
-	var dialer *dial.LimitDialer
-
-	dialer = dial.NewLimitDialer(conf.ConnLimit, connDuration, dialDuration)
-	if len(conf.MaintainedBackend) > 0 {
-		dialer.DropEndpoint(conf.MaintainedBackend)
+func respBodyCloserFactory(resp *http.Response, randomIDStr string) func() {
+	return func() {
+		if resp.Body == nil {
+			log.Debugf("ResponseBody for request %s is nil - nothing to close (handler)", randomIDStr)
+			return
+		}
+		closeErr := resp.Body.Close()
+		log.Debugf("ResponseBody for request %s closed with %s error (handler)", randomIDStr, closeErr)
 	}
+}
 
-	httpTransport := &http.Transport{
-		Dial:                dialer.Dial,
-		DisableKeepAlives:   conf.KeepAlive,
-		MaxIdleConnsPerHost: int(conf.ConnLimit)}
+func (h *Handler) validateIncomingRequest(req *http.Request) int {
+	return config.RequestHeaderContentLengthValidator(*req, h.bodyMaxSize)
+}
 
-	multiTransport := transport.NewMultiTransport(
-		httpTransport,
-		conf.BackendURLs,
-		rh.handleResponses)
-	roundTripper := Decorate(
-		multiTransport,
+// DecorateRoundTripper applies common http.RoundTripper decorators
+func DecorateRoundTripper(conf config.Client, accesslog log.Logger, healthCheckEndpoint string, rt http.RoundTripper) http.RoundTripper {
+	return Decorate(
+		rt,
 		HeadersSuplier(conf.AdditionalRequestHeaders, conf.AdditionalResponseHeaders),
-		AccessLogging(conf.Accesslog),
+		AccessLogging(accesslog),
+		OptionsHandler,
+		HealthCheckHandler(healthCheckEndpoint),
 	)
+}
+
+// NewHandlerWithRoundTripper returns Handler, but will not construct transport.MultiTransport by itself
+func NewHandlerWithRoundTripper(roundTripper http.RoundTripper, servConfig config.Server) (http.Handler, error) {
 	return &Handler{
-		config:       conf,
-		mainLog:      mainlog,
-		accessLog:    conf.Accesslog,
-		roundTripper: roundTripper,
-	}
+		roundTripper:          roundTripper,
+		bodyMaxSize:           servConfig.BodyMaxSize.SizeInBytes,
+		maxConcurrentRequests: servConfig.MaxConcurrentRequests,
+	}, nil
 }
