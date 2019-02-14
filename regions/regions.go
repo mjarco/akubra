@@ -47,13 +47,14 @@ func (rg Regions) RoundTrip(req *http.Request) (*http.Response, error) {
 		return shardsRing.DoRequest(req)
 	}
 	if rg.defaultRing != nil {
+		log.Printf("Selected default ring for request with reqHost: '%s'", reqHost)
 		return rg.defaultRing.DoRequest(req)
 	}
 	return rg.getNoSuchDomainResponse(req), nil
 }
 
 // NewRegions build new region http.RoundTripper
-func NewRegions(conf config.Regions, storages storage.ClusterStorage, syncLogger log.Logger) (http.RoundTripper, error) {
+func NewRegions(conf config.ShardingPolicies, storages storage.ClusterStorage, syncLogger log.Logger) (http.RoundTripper, error) {
 
 	ringFactory := sharding.NewRingFactory(conf, storages, syncLogger)
 	regions := &Regions{
