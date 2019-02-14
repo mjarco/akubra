@@ -18,6 +18,10 @@ import (
 	"github.com/serialx/hashring"
 )
 
+const (
+	noTimeoutRegressionHeader = "X-Akubra-No-Regression-On-Failure"
+)
+
 // ShardsRingAPI interface
 type ShardsRingAPI interface {
 	DoRequest(req *http.Request) (resp *http.Response, rerr error)
@@ -27,9 +31,9 @@ type ShardsRingAPI interface {
 // and directs requests to determined shard
 type ShardsRing struct {
 	ring                    *hashring.HashRing
-	shardClusterMap         map[string]storages.NamedCluster
+	shardClusterMap         map[string]storages.NamedShardClient
 	allClustersRoundTripper http.RoundTripper
-	clusterRegressionMap    map[string]storages.NamedCluster
+	clusterRegressionMap    map[string]storages.NamedShardClient
 	inconsistencyLog        log.Logger
 }
 
@@ -39,16 +43,16 @@ func (sr ShardsRing) isBucketPath(path string) bool {
 }
 
 // Pick finds cluster for given relative uri
-func (sr ShardsRing) Pick(key string) (storages.NamedCluster, error) {
+func (sr ShardsRing) Pick(key string) (storages.NamedShardClient, error) {
 	var shardName string
 
 	shardName, ok := sr.ring.GetNode(key)
 	if !ok {
-		return &storages.Cluster{}, fmt.Errorf("no shard for key %s", key)
+		return &storages.ShardClient{}, fmt.Errorf("no shard for key %s", key)
 	}
 	shardCluster, ok := sr.shardClusterMap[shardName]
 	if !ok {
-		return &storages.Cluster{}, fmt.Errorf("no cluster for shard %s, cannot handle key %s", shardName, key)
+		return &storages.ShardClient{}, fmt.Errorf("no cluster for shard %s, cannot handle key %s", shardName, key)
 	}
 
 	return shardCluster, nil
@@ -85,17 +89,27 @@ func copyRequest(origReq *http.Request) (*http.Request, error) {
 			newReq.Header.Add(k, vv)
 		}
 	}
+
 	if origReq.Body != nil {
 		buf := &bytes.Buffer{}
+		defer func() {
+			err := origReq.Body.Close()
+			if err != nil {
+				log.Printf("Request body close error: %s", err)
+			}
+		}()
 		n, err := io.Copy(buf, origReq.Body)
 		if err != nil {
 			return nil, err
 		}
+
 		if n > 0 {
 			newReq.Body = &reqBody{bytes: buf.Bytes()}
+		} else {
+			newReq.Body = nil
 		}
+		newReq.ContentLength = int64(buf.Len())
 	}
-	newReq.ContentLength = origReq.ContentLength
 	return newReq, nil
 }
 
@@ -123,10 +137,10 @@ func closeBody(resp *http.Response, reqID string) {
 	log.Debugf("ResponseBody for request %s closed with %s error (regression)", reqID, closeErr)
 }
 
-func (sr ShardsRing) regressionCall(cl storages.NamedCluster, origClusterName string, req *http.Request) (string, *http.Response, error) {
+func (sr ShardsRing) regressionCall(cl storages.NamedShardClient, origClusterName string, req *http.Request) (string, *http.Response, error) {
 	resp, err := sr.send(cl, req)
 	// Do regression call if response status is > 400
-	if err != nil || resp.StatusCode > 400 {
+	if shouldCallRegression(req, resp, err) {
 		rcl, ok := sr.clusterRegressionMap[cl.Name()]
 		if ok && rcl.Name() != origClusterName {
 			if resp != nil && resp.Body != nil {
@@ -138,6 +152,17 @@ func (sr ShardsRing) regressionCall(cl storages.NamedCluster, origClusterName st
 	}
 	return cl.Name(), resp, err
 }
+
+func shouldCallRegression(request *http.Request, response *http.Response, err error) bool {
+	if err == nil && response != nil {
+		return (response.StatusCode > 400) && (response.StatusCode < 500)
+	}
+	if _, hasHeader := request.Header[noTimeoutRegressionHeader]; !hasHeader {
+		return true
+	}
+	return false
+}
+
 func (sr *ShardsRing) logInconsistency(key, expectedClusterName, actualClusterName string) {
 	logJSON, err := json.Marshal(
 		struct {
